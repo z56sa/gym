@@ -1,0 +1,332 @@
+import os
+import asyncio
+import sqlite3
+import re
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+
+load_dotenv()
+TOKEN = os.getenv('TOKEN')
+PREFIX = os.getenv('PREFIX', '!')
+LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID')) if os.getenv('LOG_CHANNEL_ID') else None
+WELCOME_MSG = os.getenv('WELCOME_MSG', 'مرحباً {user}، أهلاً بك في السيرفر!')
+GUILD_ID = int(os.getenv('GUILD_ID')) if os.getenv('GUILD_ID') else None
+
+if not TOKEN:
+    print('ضع TOKEN في ملف .env ثم أعد تشغيل البرنامج')
+    raise SystemExit(1)
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.guilds = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
+
+# قاعدة البيانات
+conn = sqlite3.connect('data.db')
+cursor = conn.cursor()
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS warnings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    user_id TEXT,
+    moderator_id TEXT,
+    reason TEXT,
+    timestamp INTEGER
+)''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    user_id TEXT,
+    channel_id INTEGER
+)''')
+
+cursor.execute('''CREATE TABLE IF NOT EXISTS economy (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    user_id TEXT,
+    balance INTEGER DEFAULT 0,
+    xp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 1,
+    last_xp_time INTEGER DEFAULT 0
+)''')
+
+conn.commit()
+
+# إعدادات الحماية
+SPAM_LIMIT = 5      
+SPAM_SECONDS = 10   
+MUTE_DURATION = 60  
+LINKS_ALLOWED_ROLES = []  
+CB_NAME = 'CB'      
+
+user_messages = {}
+
+async def log_action(guild: discord.Guild, text: str):
+    if not LOG_CHANNEL_ID:
+        return
+    channel = guild.get_channel(LOG_CHANNEL_ID)
+    if channel:
+        try:
+            await channel.send(text)
+        except Exception:
+            pass
+
+async def ensure_muted_role(guild: discord.Guild) -> discord.Role:
+    role = discord.utils.get(guild.roles, name='Muted')
+    if role:
+        return role
+    role = await guild.create_role(name='Muted', reason='Role for muting members')
+    overwrite = discord.PermissionOverwrite()
+    overwrite.send_messages = False
+    overwrite.speak = False
+    for ch in guild.channels:
+        try:
+            await ch.set_permissions(role, overwrite=overwrite)
+        except Exception:
+            pass
+    return role
+
+def is_mod_check(obj):
+    perms = None
+    if isinstance(obj, commands.Context):
+        perms = obj.author.guild_permissions
+    elif isinstance(obj, discord.Interaction):
+        perms = obj.user.guild_permissions
+    return perms and (perms.kick_members or perms.ban_members or perms.manage_guild or perms.moderate_members)
+
+def save_welcome(msg: str):
+    try:
+        with open('.welcome', 'w', encoding='utf-8') as f:
+            f.write(msg)
+    except Exception:
+        pass
+
+def load_welcome():
+    global WELCOME_MSG
+    if os.path.exists('.welcome'):
+        try:
+            with open('.welcome', 'r', encoding='utf-8') as f:
+                WELCOME_MSG = f.read()
+        except Exception:
+            pass
+
+load_welcome()
+
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    if GUILD_ID:
+        try:
+            guild = discord.Object(id=GUILD_ID)
+            await bot.tree.sync(guild=guild)
+            print('Synced app commands to guild', GUILD_ID)
+        except Exception as e:
+            print('Failed to sync to guild:', e)
+    else:
+        try:
+            await bot.tree.sync()
+            print('Synced global app commands')
+        except Exception as e:
+            print('Failed to sync global commands (might take 1 hour):', e)
+    cleanup_spam_cache.start()
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    try:
+        channel = member.guild.system_channel or discord.utils.get(member.guild.text_channels, permissions=member.guild.me.guild_permissions)
+        msg = WELCOME_MSG.replace('{user}', member.mention)
+        if channel:
+            await channel.send(msg)
+            await log_action(member.guild, f'👋 مرحباً {member} (دخول جديد)')
+    except Exception:
+        pass
+
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return await bot.process_commands(message)
+    now = datetime.utcnow().timestamp()
+    user_id = (message.guild.id, message.author.id)
+    timestamps = user_messages.get(user_id, [])
+    timestamps = [t for t in timestamps if now - t < SPAM_SECONDS]
+    timestamps.append(now)
+    user_messages[user_id] = timestamps
+    if len(timestamps) > SPAM_LIMIT:
+        try:
+            muted_role = await ensure_muted_role(message.guild)
+            await message.author.add_roles(muted_role, reason='Spam mute')
+            await message.channel.send(f'{message.author.mention} تم كتمك مؤقتاً بسبب السبام لمدة {MUTE_DURATION} ثانية.')
+            await log_action(message.guild, f'🔇 **{message.author}** تم كتمه مؤقتاً بسبب السبام')
+            await asyncio.sleep(MUTE_DURATION)
+            await message.author.remove_roles(muted_role, reason='Spam mute expired')
+            await log_action(message.guild, f'🔊 **{message.author}** تم فك الكتم بعد انتهاء السبام')
+        except Exception:
+            pass
+        return
+    if re.search(r'https?://', message.content):
+        allowed = False
+        for role in message.author.roles:
+            if role.name in LINKS_ALLOWED_ROLES:
+                allowed = True
+                break
+        if not allowed:
+            try:
+                await message.delete()
+                await message.channel.send(f'{message.author.mention} ممنوع إرسال روابط هنا.')
+                await log_action(message.guild, f'🚫 **{message.author}** حاول إرسال رابط وتم الحذف')
+            except Exception:
+                pass
+            return
+    cursor.execute('SELECT balance, xp, level, last_xp_time FROM economy WHERE guild_id=? AND user_id=?',
+                   (str(message.guild.id), str(message.author.id)))
+    row = cursor.fetchone()
+    now_ms = int(now * 1000)
+    if row is None:
+        cursor.execute('INSERT INTO economy (guild_id, user_id, balance, xp, level, last_xp_time) VALUES (?, ?, 0, 0, 1, 0)',
+                       (str(message.guild.id), str(message.author.id)))
+        conn.commit()
+        balance, xp, level, last_time = 0, 0, 1, 0
+    else:
+        balance, xp, level, last_time = row
+    if now_ms - last_time > 30000:
+        xp += 5
+        balance += 2
+        last_time = now_ms
+        needed = level * 100
+        if xp >= needed:
+            level += 1
+            xp -= needed
+            await message.channel.send(f'🎉 {message.author.mention} لقد وصلت للمستوى {level}!')
+        cursor.execute('UPDATE economy SET balance=?, xp=?, level=?, last_xp_time=? WHERE guild_id=? AND user_id=?',
+                       (balance, xp, level, last_time, str(message.guild.id), str(message.author.id)))
+        conn.commit()
+    await bot.process_commands(message)
+
+@tasks.loop(minutes=10)
+async def cleanup_spam_cache():
+    now = datetime.utcnow().timestamp()
+    for key in list(user_messages.keys()):
+        user_messages[key] = [t for t in user_messages[key] if now - t < SPAM_SECONDS]
+        if not user_messages[key]:
+            del user_messages[key]
+
+class TicketView(discord.ui.View):
+    def __init__(self, author_id: int):
+        super().__init__(timeout=None)
+        self.author_id = author_id
+
+    @discord.ui.button(label='إغلاق التذكرة', style=discord.ButtonStyle.red, emoji='🔒')
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id and not is_mod_check(interaction):
+            await interaction.response.send_message('ليس لديك صلاحية لإغلاق هذه التذكرة.', ephemeral=True)
+            return
+        await interaction.response.send_message('هل أنت متأكد من الإغلاق؟ اكتب `تأكيد` خلال 15 ثانية', ephemeral=True)
+        def check(m):
+            return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
+        try:
+            msg = await bot.wait_for('message', check=check, timeout=15)
+            if msg.content.lower() == 'تأكيد':
+                await log_action(interaction.guild, f'🔒 **{interaction.user}** أغلق التذكرة {interaction.channel.name}')
+                await interaction.channel.delete()
+                cursor.execute('DELETE FROM tickets WHERE channel_id=?', (interaction.channel.id,))
+                conn.commit()
+            else:
+                await interaction.channel.send('تم الإلغاء.')
+        except asyncio.TimeoutError:
+            await interaction.channel.send('انتهت المهلة. تم إلغاء الإغلاق.')
+
+@bot.tree.command(name='ticket')
+@app_commands.describe(reason='سبب فتح التذكرة')
+async def ticket_slash(interaction: discord.Interaction, reason: str = 'بدون سبب'):
+    guild = interaction.guild
+    member = interaction.user
+    name = f'ticket-{member.name}'.lower()[:90]
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        member: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+    }
+    channel = await guild.create_text_channel(name, overwrites=overwrites, reason=f'Ticket for {member}')
+    await channel.send(f'🎫 تذكرة من {member.mention} — {reason}', view=TicketView(author_id=member.id))
+    cursor.execute('INSERT INTO tickets (guild_id, user_id, channel_id) VALUES (?, ?, ?)',
+                   (str(guild.id), str(member.id), channel.id))
+    conn.commit()
+    await interaction.response.send_message(f'تم إنشاء التذكرة: {channel.mention}', ephemeral=True)
+    await log_action(guild, f'🎫 **{member}** فتح تذكرة — {reason}')
+
+@bot.tree.command(name='balance')
+@app_commands.describe(user='اختياري - عرض رصيد مستخدم')
+async def balance_slash(interaction: discord.Interaction, user: discord.User = None):
+    target = user or interaction.user
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (str(interaction.guild.id), str(target.id)))
+    row = cursor.fetchone()
+    bal = row[0] if row else 0
+    await interaction.response.send_message(f'💰 رصيد {target.mention} هو {bal} {CB_NAME}.', ephemeral=True)
+
+@bot.tree.command(name='pay')
+@app_commands.describe(user='الشخص الذي تريد الدفع له', amount='المبلغ')
+async def pay_slash(interaction: discord.Interaction, user: discord.User, amount: int):
+    if amount <= 0:
+        return await interaction.response.send_message('الرجاء إدخال مبلغ صحيح أكبر من صفر.', ephemeral=True)
+    payer_id = str(interaction.user.id)
+    guild_id = str(interaction.guild.id)
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (guild_id, payer_id))
+    row = cursor.fetchone()
+    payer_balance = row[0] if row else 0
+    if payer_balance < amount:
+        return await interaction.response.send_message(f'ليس لديك رصيد كافي. رصيدك الحالي: {payer_balance} {CB_NAME}.', ephemeral=True)
+    payee_id = str(user.id)
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (guild_id, payee_id))
+    row = cursor.fetchone()
+    payee_balance = row[0] if row else 0
+    # تحديث الحسابات
+    cursor.execute('UPDATE economy SET balance=? WHERE guild_id=? AND user_id=?', (payer_balance - amount, guild_id, payer_id))
+    if row:
+        cursor.execute('UPDATE economy SET balance=? WHERE guild_id=? AND user_id=?', (payee_balance + amount, guild_id, payee_id))
+    else:
+        cursor.execute('INSERT INTO economy (guild_id, user_id, balance) VALUES (?, ?, ?)', (guild_id, payee_id, amount))
+    conn.commit()
+    await interaction.response.send_message(f'✅ تم تحويل {amount} {CB_NAME} إلى {user.mention}.', ephemeral=True)
+
+# أوامر بريفكس مشابهة (اختياري إضافتها)
+
+@bot.command(name='balance')
+async def balance_cmd(ctx: commands.Context, user: discord.User = None):
+    target = user or ctx.author
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (str(ctx.guild.id), str(target.id)))
+    row = cursor.fetchone()
+    bal = row[0] if row else 0
+    await ctx.reply(f'💰 رصيد {target.mention} هو {bal} {CB_NAME}.')
+
+@bot.command(name='pay')
+async def pay_cmd(ctx: commands.Context, user: discord.User, amount: int):
+    if amount <= 0:
+        return await ctx.reply('الرجاء إدخال مبلغ صحيح أكبر من صفر.')
+    payer_id = str(ctx.author.id)
+    guild_id = str(ctx.guild.id)
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (guild_id, payer_id))
+    row = cursor.fetchone()
+    payer_balance = row[0] if row else 0
+    if payer_balance < amount:
+        return await ctx.reply(f'ليس لديك رصيد كافي. رصيدك الحالي: {payer_balance} {CB_NAME}.')
+    payee_id = str(user.id)
+    cursor.execute('SELECT balance FROM economy WHERE guild_id=? AND user_id=?', (guild_id, payee_id))
+    row = cursor.fetchone()
+    payee_balance = row[0] if row else 0
+    cursor.execute('UPDATE economy SET balance=? WHERE guild_id=? AND user_id=?', (payer_balance - amount, guild_id, payer_id))
+    if row:
+        cursor.execute('UPDATE economy SET balance=? WHERE guild_id=? AND user_id=?', (payee_balance + amount, guild_id, payee_id))
+    else:
+        cursor.execute('INSERT INTO economy (guild_id, user_id, balance) VALUES (?, ?, ?)', (guild_id, payee_id, amount))
+    conn.commit()
+    await ctx.reply(f'✅ تم تحويل {amount} {CB_NAME} إلى {user.mention}.')
+
+if __name__ == '__main__':
+    try:
+        bot.run(MTQwMzg1MDgxNDAwNjc1OTQ2NQ.Gg2x3P.TXjYWhBjh_FofLqYM8CKKQc-k1CdZLWa66nHqs)
